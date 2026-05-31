@@ -1,0 +1,84 @@
+run:
+  output_dir: ../runs/image_caption_arch_cad
+  resume: true
+
+init:
+  data_dir: ../../data/image_caption_arch_cad
+  prompt_snapshot: true
+  default_language: en
+  api_max_retries: 3
+  api_base_delay: 2.0
+
+models:
+  strong_vision:
+    api_key_env: LLM_API_KEY
+    base_url_env: LLM_BASE_URL
+    model_env: LLM_MODEL
+    base_url: ${LLM_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
+    model: ${LLM_MODEL:-qwen3.5-plus}
+    stream: true
+    allow_nonstream_fallback: true
+    timeout: 300
+    temperature: 0.1
+    max_tokens: 8192
+  judge_vision:
+    api_key_env: JUDGE_API_KEY
+    base_url_env: JUDGE_BASE_URL
+    model_env: JUDGE_MODEL
+    base_url: ${JUDGE_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
+    model: ${JUDGE_MODEL:-qwen3.5-plus}
+    stream: true
+    allow_nonstream_fallback: true
+    timeout: 300
+    temperature: 0.1
+    max_tokens: 4096
+
+operators:
+  extract_evidence:
+    enabled: true
+    model_profile: strong_vision
+    temperature: 0.1
+    max_tokens: 8192
+    stream: true
+    allow_nonstream_fallback: true
+  induce_rrels:
+    enabled: true
+    model_profile: strong_vision
+    temperature: 0.1
+    max_tokens: 8192
+    stream: true
+    allow_nonstream_fallback: true
+  compose_path:
+    enabled: true
+    model_profile: strong_vision
+    temperature: 0.1
+    max_tokens: 8192
+    stream: true
+    allow_nonstream_fallback: true
+  generate_sft_qa:
+    enabled: true
+    model_profile: strong_vision
+    temperature: 0.3
+    max_tokens: 4096
+    stream: true
+    allow_nonstream_fallback: true
+  judge_quality:
+    enabled: true
+    model_profile: judge_vision
+    temperature: 0.1
+    max_tokens: 4096
+    stream: true
+    allow_nonstream_fallback: true
+
+judge:
+  max_retries: 2
+  accept_threshold: 0.7
+  dimension_floor: 0.4
+  factual_correctness_floor: 0.8
+
+generation:
+  local_max_retries: 2
+
+compose:
+  local_max_retries: 2
+
