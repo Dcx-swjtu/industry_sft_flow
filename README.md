@@ -25,14 +25,6 @@ tools/                   Utility scripts
 run_scienceflow_sft.py   CLI entrypoint
 ```
 
-Local run artifacts are intentionally excluded from git:
-
-```text
-runs/
-codex.md
-MIGRATION_GUIDE.md
-__pycache__/
-```
 
 ## Configuration
 
