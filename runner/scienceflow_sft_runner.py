@@ -69,6 +69,19 @@ def _is_hard_pass(judge_result: JudgeResult) -> bool:
     )
 
 
+def _sample_metadata_snapshot(sample: Dict[str, Any], *, include_image_base64: bool) -> Dict[str, Any]:
+    snapshot = dict(sample)
+    image_base64 = snapshot.get("image_base64")
+    if include_image_base64 or not image_base64:
+        return snapshot
+    snapshot["image_base64"] = None
+    raw_record = dict(snapshot.get("raw_record") or {})
+    raw_record["image_base64_omitted"] = True
+    raw_record["image_base64_chars"] = len(str(image_base64))
+    snapshot["raw_record"] = raw_record
+    return snapshot
+
+
 class ScienceflowSFTRunStore:
     def __init__(self, root_dir: str):
         self.root_dir = Path(root_dir).resolve()
@@ -153,13 +166,14 @@ class ScienceflowSFTRunner:
         self.config_dir = Path(self.config["_meta"]["config_dir"])
         self.data_dir = (self.config_dir / self.config["init"]["data_dir"]).resolve()
         self.output_root = (self.config_dir / self.config["run"]["output_dir"]).resolve()
-        self.prompt_snapshot_enabled = bool(self.config["init"].get("prompt_snapshot", True))
+        init_cfg = self.config.get("init", {})
+        self.prompt_snapshot_enabled = init_cfg.get("prompt_snapshot", True)
+        self.snapshot_image_base64 = bool(init_cfg.get("snapshot_image_base64", False))
         self.router = ModelRouter(self.config)
         self.run_store = ScienceflowSFTRunStore(str(self.output_root))
         self.operator_names = list(SCIENCEFLOW_SFT_OPERATOR_DIRS.keys())
 
         # API retry config for stages 1-4
-        init_cfg = self.config.get("init", {})
         self.api_max_retries = int(init_cfg.get("api_max_retries", 3))
         self.api_base_delay = float(init_cfg.get("api_base_delay", 2.0))
 
@@ -204,7 +218,10 @@ class ScienceflowSFTRunner:
             if not (meta_dir / "sample.json").exists():
                 self.run_store.save_meta(
                     run_dir,
-                    sample=sample.to_dict(),
+                    sample=_sample_metadata_snapshot(
+                        sample.to_dict(),
+                        include_image_base64=self.snapshot_image_base64,
+                    ),
                     config=self.config,
                     routing=self._routing_snapshot(),
                 )

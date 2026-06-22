@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -29,20 +30,32 @@ def _print_result(result: dict) -> None:
     print(f"Rejected after retries: {result.get('final_summary', {}).get('rejected_after_retries')}")
 
 
+def _resolve_worker_count(requested: int, total: int) -> int:
+    if total <= 0:
+        return 1
+    if requested > 0:
+        return requested
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(total, max(32, cpu_count * 8)))
+
+
 def _run_batch(sample_ids: list[str], *, config_path: str, resume: bool, workers: int) -> None:
-    from runner.scienceflow_sft_runner import run_scienceflow_sft
+    from runner.scienceflow_sft_runner import ScienceflowSFTRunner
 
     total = len(sample_ids)
+    resolved_workers = _resolve_worker_count(workers, total)
+    runner = ScienceflowSFTRunner(config_path)
     results_summary: list[tuple[str, str, str]] = [None] * total  # type: ignore[assignment]
 
     def _run_one(idx: int, sid: str) -> tuple[int, str, dict | None, Exception | None]:
         try:
-            result = run_scienceflow_sft(sid, config_path=config_path, resume=resume)
+            result = runner.run(sid, resume=resume)
             return idx, sid, result, None
         except Exception as e:
             return idx, sid, None, e
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    print(f"[batch] Running {total} samples with {resolved_workers} workers")
+    with ThreadPoolExecutor(max_workers=resolved_workers, thread_name_prefix="scienceflow-batch") as pool:
         futures = {pool.submit(_run_one, i, sid): i for i, sid in enumerate(sample_ids)}
         for future in as_completed(futures):
             idx, sid, result, exc = future.result()
@@ -92,7 +105,13 @@ def main() -> None:
     batch_parser.add_argument("sample_ids", nargs="+", help="Sample IDs, e.g. sample_000 sample_001")
     batch_parser.add_argument("--config", default=default_config, help="Path to config YAML")
     batch_parser.add_argument("--no-resume", action="store_true", help="Disable resume")
-    batch_parser.add_argument("-w", "--workers", type=int, default=4, help="Parallel workers (default: 4)")
+    batch_parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel workers. Use 0 for auto high-throughput mode (default: 4)",
+    )
 
     args = parser.parse_args()
 
