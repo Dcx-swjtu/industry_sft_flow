@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import sys
 import tempfile
 import unittest
@@ -28,7 +29,26 @@ from operators.generate_sft_qa import (  # noqa: E402
 )
 from operators.induce_rrels import _repair_rrel_contract, normalize_and_validate_rrel_result  # noqa: E402
 from operators.judge_quality import _enforce_thresholds, _validate_judge_contract  # noqa: E402
-from runner.scienceflow_sft_runner import ScienceflowSFTRunStore, _is_hard_pass  # noqa: E402
+from dataflow.infra.samples import load_sample  # noqa: E402
+from dataflow.operators.common import (  # noqa: E402
+    _clear_completion_url_cache,
+    _completion_urls,
+    _remember_completion_url,
+    _snapshot_mode,
+    invoke_prompt,
+)
+from runner.scienceflow_sft_runner import (  # noqa: E402
+    ScienceflowSFTRunStore,
+    _is_hard_pass,
+    _sample_metadata_snapshot,
+)
+from run_scienceflow_sft import _resolve_worker_count  # noqa: E402
+
+
+_TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADgQG"
+    "BgeJ6WQAAAABJRU5ErkJggg=="
+)
 
 
 class JudgeContractTests(unittest.TestCase):
@@ -400,6 +420,136 @@ class MetadataSecurityTests(unittest.TestCase):
                 stored = json.load(handle)
 
         self.assertEqual(stored["token"], "***REDACTED***")
+
+    def test_sample_metadata_omits_large_image_base64_by_default(self) -> None:
+        snapshot = _sample_metadata_snapshot(
+            {
+                "sample_id": "sample_test",
+                "image_base64": "data:image/png;base64," + "a" * 100,
+                "raw_record": {"source": "unit"},
+            },
+            include_image_base64=False,
+        )
+
+        self.assertIsNone(snapshot["image_base64"])
+        self.assertTrue(snapshot["raw_record"]["image_base64_omitted"])
+        self.assertGreater(snapshot["raw_record"]["image_base64_chars"], 100)
+
+
+class InvocationPerformanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _clear_completion_url_cache()
+
+    def tearDown(self) -> None:
+        _clear_completion_url_cache()
+
+    def test_completion_url_cache_prioritizes_known_working_endpoint(self) -> None:
+        self.assertEqual(
+            _completion_urls("http://relay"),
+            ["http://relay/chat/completions", "http://relay/v1/chat/completions"],
+        )
+
+        _remember_completion_url("http://relay", "http://relay/v1/chat/completions")
+
+        self.assertEqual(
+            _completion_urls("http://relay"),
+            ["http://relay/v1/chat/completions", "http://relay/chat/completions"],
+        )
+
+    def test_snapshot_mode_accepts_failure_only_mode(self) -> None:
+        self.assertEqual(_snapshot_mode("failure"), "failure")
+        self.assertEqual(_snapshot_mode(True), "all")
+        self.assertEqual(_snapshot_mode(False), "none")
+
+    def test_failure_only_snapshot_skips_successful_calls(self) -> None:
+        class Template:
+            requires_image = False
+
+            @staticmethod
+            def render(payload):
+                return "prompt"
+
+        class Router:
+            @staticmethod
+            def resolve(_operator_name):
+                return type("Runtime", (), {
+                    "profile": type("Profile", (), {
+                        "api_key": "test-key",
+                        "api_key_env": "TEST_KEY",
+                        "base_url": "http://relay/v1",
+                        "model": "test-model",
+                    })(),
+                    "stream": False,
+                    "temperature": 0.1,
+                    "max_tokens": 128,
+                    "timeout": 10,
+                    "enable_thinking": False,
+                    "reasoning_effort": "",
+                })()
+
+        response = {
+            "choices": [{
+                "message": {"content": "{\"ok\": true}"}
+            }]
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            prompt_dir = Path(tmp_dir) / "prompt"
+            with patch("dataflow.operators.common._post_json", return_value=response):
+                parsed = invoke_prompt(
+                    template=Template(),
+                    payload={"x": 1},
+                    image_base64=None,
+                    operator_name="extract_evidence",
+                    prompt_name="extract_evidence",
+                    prompt_dir=prompt_dir,
+                    router=Router(),
+                    prompt_snapshot_enabled="failure",
+                    max_retries=1,
+                )
+
+            self.assertEqual(parsed, {"ok": True})
+            self.assertFalse(prompt_dir.exists())
+
+
+class BatchWorkerTests(unittest.TestCase):
+    def test_zero_workers_means_auto_high_throughput(self) -> None:
+        workers = _resolve_worker_count(0, total=1000)
+
+        self.assertGreaterEqual(workers, 32)
+        self.assertLessEqual(workers, 1000)
+
+    def test_positive_workers_are_preserved(self) -> None:
+        self.assertEqual(_resolve_worker_count(7, total=1000), 7)
+
+
+class ParquetSampleLoadingTests(unittest.TestCase):
+    def test_load_sample_supports_automix_multimodal_parquet(self) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            table = pa.table({
+                "sample_id": pa.array(["parquet_sample"]),
+                "problem": pa.array(["<image>\nWhat differs between the panels?"]),
+                "answer": pa.array(["Panel a is denser than panel b."]),
+                "images": pa.array([[_TINY_PNG]], type=pa.list_(pa.binary())),
+                "source": pa.array(["unit_test"]),
+                "image_path": pa.array(["/does/not/exist.png"]),
+                "question_type": pa.array(["compare"]),
+            })
+            pq.write_table(table, data_dir / "sft_vqa_00000.parquet")
+
+            sample = load_sample(str(data_dir), "parquet_sample")
+
+        self.assertEqual(sample.sample_id, "parquet_sample")
+        self.assertEqual(sample.caption, "What differs between the panels?")
+        self.assertEqual(sample.context, ["Panel a is denser than panel b."])
+        self.assertTrue(sample.image_base64.startswith("data:image/png;base64,"))
+        self.assertEqual(sample.raw_record["dataset_format"], "automix_multimodal_parquet")
 
 
 if __name__ == "__main__":
